@@ -68,30 +68,31 @@ class StockPredictor(object):
         print("Fetching training data ...")
         res = es.search(index="market", doc_type="quote", size=10000, body={"query": {"match": {"ticker": self.ticker}}})
         self.training_data = json_normalize(res['hits']['hits'])
+        self.chunked_training_data = self.training_data
 
-        vectors = []
-        chunked_training_data_lengths = []
-        start_index = 0
-        end_index = start_index + self.chunks
-        delta_date_index = end_index + self.delta
+        #vectors = []
+        #chunked_training_data_lengths = []
+        #start_index = 0
+        #end_index = start_index + self.chunks
+        #delta_date_index = end_index + self.delta
 
-        while delta_date_index <= len(self.training_data):
-            training_chunk = self.training_data[start_index:end_index]
-            delta_chunk = self.training_data.iloc[delta_date_index]
-            total_chunk = training_chunk.append(delta_chunk)
-            #print("%s training_chunk to train %s" % (total_chunk, self.ticker))
-            start_index = end_index + 1
-            end_index = start_index + self.chunks
-            delta_date_index = end_index + self.delta
-            vectors.append(total_chunk)
-            chunked_training_data_lengths.append(len(total_chunk))
-            if self.verbose: print(total_chunk)
+        #while delta_date_index <= len(self.training_data):
+        #training_chunk = self.training_data[start_index:end_index]
+        #    delta_chunk = self.training_data.iloc[delta_date_index]
+        #    total_chunk = training_chunk.append(delta_chunk)
+        #    #print("%s training_chunk to train %s" % (total_chunk, self.ticker))
+        #    start_index = end_index + 1
+        #    end_index = start_index + self.chunks
+        #    delta_date_index = end_index + self.delta
+        #    vectors.append(total_chunk)
+        #    chunked_training_data_lengths.append(len(total_chunk))
+        #    if self.verbose: print(total_chunk)
 
-        self.chunked_training_data = pd.DataFrame(np.concatenate(vectors), columns = self.training_data.columns)
-        self.chunked_training_data_lengths = chunked_training_data_lengths
+        #self.chunked_training_data = pd.DataFrame(np.concatenate(vectors), columns = self.training_data.columns)
+        #self.chunked_training_data_lengths = chunked_training_data_lengths
 
-        if self.verbose: print("Latest record for training:\n%s" % self.training_data.tail(1))
-        latest_date = self.training_data.tail(1)['_source.timestamp']
+        if self.verbose: print("Latest record for training:\n%s" % self.chunked_training_data.tail(1))
+        latest_date = self.chunked_training_data.tail(1)['_source.timestamp']
         datetime_object = datetime.datetime.strptime(latest_date.values[0], '%Y-%m-%dT%H:%M:%S')
 
         if self.prediction_date == None:
@@ -113,7 +114,8 @@ class StockPredictor(object):
         if self.verbose: print("feature vector %s" % feature_vector)
         print('Training Model with %s features' % feature_vector.size)
         print("Latest date to be used in training is %s" % self.chunked_training_data.tail(1)['_source.timestamp'].values[0])
-        self.hmm.fit(feature_vector, self.chunked_training_data_lengths)
+        #self.hmm.fit(feature_vector, self.chunked_training_data_lengths)
+        self.hmm.fit(feature_vector)
         print('Model trained')
 
     def _compute_all_possible_outcomes(self, n_steps_frac_change,
@@ -254,6 +256,10 @@ class StockPredictor(object):
             es_array += "\n"
         return es_array
 
+def delete_all_prediction_data():
+   print("Deleting all PREDICTION data")
+   es.delete_by_query(index=INDEX_NAME,doc_type=TYPE_NAME, body={'query': {'match_all': {}}})
+
 if __name__ == '__main__':
     arguments = docopt(__doc__, version='train 0.1')
     ticker = arguments['<ticker>']
@@ -261,30 +267,23 @@ if __name__ == '__main__':
 
     if ticker == "ALL":
         print("Training all models")
-        with open('nasdaq100list.csv', 'r') as f:
-            reader = csv.reader(f)
-            stocks = list(reader)
-            for stock in stocks:
-                ticker = stock[0]
-                if ticker == "Symbol": continue
+
+        if date == "ALL":
+            delete_all_prediction_data()
+            print("Fetching dates ...")
+            res = es.search(index="market", doc_type="quote", size=10000, body={"query": { "range" : { "timestamp" : { "gte" : "2019-03-10T06:00:00"}}}})
+            rows = json_normalize(res['hits']['hits'])
+            print(rows)
+            for row in rows.iterrows():
                 try:
+                    actual_date = row[1]['_source.timestamp']
+                    ticker = row[1]['_source.ticker']
 
-                    if date == "ALL":
-                        print("Fetching dates ...")
-                        res = es.search(index="market", doc_type="quote", size=10000, body={"query": { "range" : { "timestamp" : { "gte" : "2019-03-10T06:00:00"}}}})
-                        date_data = json_normalize(res['hits']['hits'])
-                        for processing_date in date_data.iterrows():
-                            actual_date = processing_date[1]['_source.timestamp']
+                    print("predicting %s on %s" % (ticker, actual_date))
+                    stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0, prediction_date = actual_date)
+                    stock_predictor.fit()
+                    stock_predictor.predict_outcomes()
 
-                            print("predicting %s on %s" % (ticker, actual_date))
-                            stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0, prediction_date = actual_date)
-                            stock_predictor.fit()
-                            stock_predictor.predict_outcomes()
-                    else:
-                            print("predicting %s on %s" % (ticker, prediction_date))
-                            stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0, prediction_date = prediction_date)
-                            stock_predictor.fit()
-                            stock_predictor.predict_outcomes()
                 except:
                     print("Failed to train models for %s" % ticker)
     else:

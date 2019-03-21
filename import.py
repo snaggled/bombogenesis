@@ -113,6 +113,10 @@ class Importer(object):
 #    data = fetch_data(ticker)
 #    import_data(data)
 
+def delete_all_stock_data():
+        print("Deleting all stock data")
+        es.delete_by_query(index=INDEX_NAME,doc_type=TYPE_NAME, body={'query': {'match_all': {}}})
+
 def import_ticker(ticker, delete=False):
 
     if delete:
@@ -129,15 +133,16 @@ if __name__ == '__main__':
     arguments = docopt(__doc__, version='import 0.1')
     ticker = arguments['<ticker>']
     if ticker == "ALL":
+        delete_all_stock_data()
         print("Fetching all data")
-        with open('nasdaq100list.csv', 'r') as f:
+        with open('sp500.csv', 'r') as f:
             reader = csv.reader(f)
             stocks = list(reader)
             for stock in stocks:
                 ticker = stock[0]
                 if ticker == "Symbol": continue
                 try:
-                    import_ticker(ticker, delete=True)
+                    import_ticker(ticker, delete=False)
                 except:
                     print("Failed to import %s" % ticker)
     else:

@@ -1,7 +1,7 @@
 """accuracy.py
 
 Usage:
-  accuracy.py <ticker> <date>
+  accuracy.py
 
 """
 
@@ -131,25 +131,22 @@ class AccuracyCalculator(object):
         return es_array
 
 
+def delete_all_accuracy_data():
+   print("Deleting all accuracy data")
+   es.delete_by_query(index="accuracy",doc_type="accuracy", body={'query': {'match_all': {}}})
+
 if __name__ == '__main__':
     # "2019-01-02T06:00:00"
-    arguments = docopt(__doc__, version='accuracy 0.1')
-    ticker = arguments['<ticker>']
-    date = arguments['<date>']
 
-    if ticker == "ALL":
-        print("Caculating Accuracy for all models on date %s" % date)
-        with open('nasdaq100list.csv', 'r') as f:
-            reader = csv.reader(f)
-            stocks = list(reader)
-            for stock in stocks:
-                ticker = stock[0]
-                if ticker == "Symbol": continue
-                try:
-                    accuracy_calculator = AccuracyCalculator(ticker=ticker, verbose=True, prediction_date = date)
-                    accuracy_calculator.calculate()
-                except:
-                    print("Failed to train models for %s" % ticker)
-    else:
-        accuracy_calculator = AccuracyCalculator(ticker=ticker, verbose=True, prediction_date = date)
+    delete_all_accuracy_data()
+    print("Fetching dates ...")
+    res = es.search(index="predictions", doc_type="outcome", size=10000, body={"query": { "range" : { "timestamp" : { "gte" : "2019-03-10T06:00:00"}}}})
+    rows = json_normalize(res['hits']['hits'])
+    print(rows)
+
+    for row in rows.iterrows():
+        actual_date = row[1]['_source.timestamp']
+        ticker = row[1]['_source.ticker']
+        print("calculating accuracy for %s on %s" % (ticker, actual_date))
+        accuracy_calculator = AccuracyCalculator(ticker=ticker, verbose=True, prediction_date = actual_date)
         accuracy_calculator.calculate()
