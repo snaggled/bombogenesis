@@ -1,7 +1,7 @@
 """train.py
 
 Usage:
-  train.py <ticker> 
+  train.py <ticker> <date>
 
 """
 
@@ -25,6 +25,8 @@ import datetime
 
 INDEX_NAME = 'predictions'
 TYPE_NAME = 'outcome'
+TRADE_TYPE_NAME = 'trades'
+TRADE_INDEX_NAME = 'recommendation'
 ID_FIELD = 'date'
 
 es = Elasticsearch()
@@ -48,14 +50,16 @@ class ESProxy(object):
 
 class StockPredictor(object):
 
-    def __init__(self, ticker, chunks = 9, delta = 0, n_hidden_states=5, n_latency_days=10, n_steps_frac_change=50, n_steps_frac_high=30, n_steps_frac_low=10, n_iter=1000, verbose=False):
+    def __init__(self, ticker, chunks = 9, delta = 0, n_hidden_states=5, n_latency_days=10, n_steps_frac_change=10, n_steps_frac_high=30, n_steps_frac_low=10, n_iter=100, verbose=False, prediction_date=None):
 
+        self.total_score = 0
         self.verbose = verbose
         self.ticker = ticker
         self.n_latency_days = n_latency_days
         self.hmm = GMMHMM(n_components=n_hidden_states, n_iter=n_iter)
         self.chunks = chunks
         self.delta = delta
+        self.prediction_date = prediction_date
         self.fetch_training_data()
         self._compute_all_possible_outcomes(n_steps_frac_change, n_steps_frac_high, n_steps_frac_low)
 
@@ -89,9 +93,10 @@ class StockPredictor(object):
         if self.verbose: print("Latest record for training:\n%s" % self.training_data.tail(1))
         latest_date = self.training_data.tail(1)['_source.timestamp']
         datetime_object = datetime.datetime.strptime(latest_date.values[0], '%Y-%m-%dT%H:%M:%S')
-        prediction_date = datetime_object + timedelta(days=self.delta + 1)
 
-        self.prediction_date = datetime.datetime.strftime(prediction_date, '%Y-%m-%dT%H:%M:%S')
+        if self.prediction_date == None:
+            prediction_date = datetime_object + timedelta(days=self.delta + 1)
+            self.prediction_date = datetime.datetime.strftime(prediction_date, '%Y-%m-%dT%H:%M:%S')
 
     @staticmethod
     def _extract_features(data):
@@ -114,11 +119,39 @@ class StockPredictor(object):
     def _compute_all_possible_outcomes(self, n_steps_frac_change,
                                        n_steps_frac_high, n_steps_frac_low):
         frac_change_range = np.linspace(-0.1, 0.1, n_steps_frac_change)
-        frac_high_range = np.linspace(0, 0.1, n_steps_frac_high)
-        frac_low_range = np.linspace(0, 0.1, n_steps_frac_low)
+        frac_high_range = np.linspace(0, 0.05, n_steps_frac_high)
+        frac_low_range = np.linspace(0, 0.05, n_steps_frac_low)
 
         self.all_possible_outcomes = np.array(list(itertools.product(
             frac_change_range, frac_high_range, frac_low_range)))
+
+    def json_data_for_trade(self):
+
+        rows = list()
+
+        # meta
+        ticker = self.ticker
+        date = self.prediction_date
+        total_score = self.total_score
+        id = "%s-%s-%s" % (ticker, date, total_score)
+
+        meta = {
+            "index": {
+                "_index": TRADE_INDEX_NAME,
+                "_type": TRADE_TYPE_NAME,
+                "_id": id
+            }
+        }
+        rows.append(json.dumps(meta))
+
+        # data
+        row = ObjDict()
+        row.total_score = total_score
+        row.timestamp = self.prediction_date
+        row.ticker = self.ticker
+        rows.append(json.dumps(row))
+
+        return rows
 
     def json_data_for_outcome(self, outcome, score):
 
@@ -184,6 +217,7 @@ class StockPredictor(object):
         #self.delete_and_create_index()
 
         bulk_data = list()
+        trade_data = list()
         outcome_score = []
 
         for possible_outcome in self.all_possible_outcomes:
@@ -196,20 +230,34 @@ class StockPredictor(object):
                 rows = self.json_data_for_outcome(possible_outcome, score)
                 bulk_data.append(rows)
 
-        # format for ES, ugly
+                if possible_outcome[0] > 0:
+                    self.total_score = self.total_score + score
+                if possible_outcome[0] < 0:
+                    self.total_score = self.total_score - score
+                trade_rows = self.json_data_for_trade()
+                trade_data.append(trade_rows)
+
+        print("Exporting predictions to ES")
+
+        es_array = self.format_data_for_es(bulk_data)
+        res = es.bulk(index = INDEX_NAME, body = es_array, refresh = True)
+
+        es_array = self.format_data_for_es(trade_data)
+        res = es.bulk(index = TRADE_INDEX_NAME, body = es_array, refresh = True)
+
+    def format_data_for_es(self, data):
         es_array = ""
-        for row in bulk_data:
+        for row in data:
             es_array += row[0]
             es_array += "\n"
             es_array += row[1]
             es_array += "\n"
-
-        print("Exporting predictions to ES")
-        res = es.bulk(index = INDEX_NAME, body = es_array, refresh = True)
+        return es_array
 
 if __name__ == '__main__':
     arguments = docopt(__doc__, version='train 0.1')
     ticker = arguments['<ticker>']
+    date = arguments['<date>']
 
     if ticker == "ALL":
         print("Training all models")
@@ -220,20 +268,28 @@ if __name__ == '__main__':
                 ticker = stock[0]
                 if ticker == "Symbol": continue
                 try:
-                    stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0)
-                    stock_predictor.delete_prediction_data(ticker)
-                    stock_predictor.fit()
-                    stock_predictor.predict_outcomes()
 
-                    #stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=14, delta = 4)
-                    #stock_predictor.fit()
-                    #stock_predictor.predict_outcomes()
+                    if date == "ALL":
+                        print("Fetching dates ...")
+                        res = es.search(index="market", doc_type="quote", size=10000, body={"query": { "range" : { "timestamp" : { "gte" : "2019-03-10T06:00:00"}}}})
+                        date_data = json_normalize(res['hits']['hits'])
+                        for processing_date in date_data.iterrows():
+                            actual_date = processing_date[1]['_source.timestamp']
+
+                            print("predicting %s on %s" % (ticker, actual_date))
+                            stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0, prediction_date = actual_date)
+                            stock_predictor.fit()
+                            stock_predictor.predict_outcomes()
+                    else:
+                            print("predicting %s on %s" % (ticker, prediction_date))
+                            stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0, prediction_date = prediction_date)
+                            stock_predictor.fit()
+                            stock_predictor.predict_outcomes()
                 except:
                     print("Failed to train models for %s" % ticker)
     else:
 
+        stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0, prediction_date = date)
         #stock_predictor.delete_prediction_data(ticker)
-        stock_predictor = StockPredictor(ticker=ticker, verbose=False, chunks=9, delta = 0)
-        stock_predictor.delete_prediction_data(ticker)
         stock_predictor.fit()
         stock_predictor.predict_outcomes()
